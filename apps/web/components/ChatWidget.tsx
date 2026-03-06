@@ -24,6 +24,18 @@ interface DisplayMessage {
   extracted?: ExtractedComplaint | null;
   /** Image-based ticket preview from FastAPI /analyze */
   imagePreview?: ImageTicketPreview | null;
+  /** Reverse-geocoded details for text-based complaints */
+  geoDetails?: GeoDetails | null;
+}
+
+interface GeoDetails {
+  pincode: string;
+  locality: string;
+  city: string;
+  district: string;
+  state: string;
+  formatted_address: string;
+  digipin: string;
 }
 
 /** Shape of the /analyze response from FastAPI */
@@ -100,6 +112,7 @@ export default function ChatWidget() {
   const [pendingComplaint, setPendingComplaint] = useState<ExtractedComplaint | null>(null);
   const [pendingImagePreview, setPendingImagePreview] = useState<ImageTicketPreview | null>(null);
   const [pendingImageFile, setPendingImageFile] = useState<File | null>(null);
+  const [pendingImageDataUrl, setPendingImageDataUrl] = useState<string | null>(null);
   const [pendingLocation, setPendingLocation] = useState<DeviceLocation | null>(null);
   const [locationConfirmed, setLocationConfirmed] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -200,10 +213,10 @@ export default function ChatWidget() {
 
   /* ----- message helpers ----- */
   const addBotMessage = useCallback(
-    (text: string, extra?: { extracted?: ExtractedComplaint | null; imagePreview?: ImageTicketPreview | null }) => {
+    (text: string, extra?: { extracted?: ExtractedComplaint | null; imagePreview?: ImageTicketPreview | null; geoDetails?: GeoDetails | null }) => {
       setMessages((prev) => [
         ...prev,
-        { id: uid(), role: "bot", text, extracted: extra?.extracted, imagePreview: extra?.imagePreview },
+        { id: uid(), role: "bot", text, extracted: extra?.extracted, imagePreview: extra?.imagePreview, geoDetails: extra?.geoDetails },
       ]);
       setTimeout(scrollToBottom, 80);
     },
@@ -222,6 +235,7 @@ export default function ChatWidget() {
       const reader = new FileReader();
       reader.onload = async () => {
         const dataUrl = reader.result as string;
+        setPendingImageDataUrl(dataUrl);
 
         // Show user message with image thumbnail
         setMessages((prev) => [
@@ -333,12 +347,21 @@ export default function ChatWidget() {
       if (res.extracted) {
         setPendingComplaint(res.extracted);
         setPendingImagePreview(null);
+        setPendingImageDataUrl(null);
         const currentLocation = await getLocation();
         setPendingLocation(currentLocation);
         setLocationConfirmed(false);
-      }
 
-      addBotMessage(res.reply, { extracted: res.extracted });
+        let geoDetails: GeoDetails | null = null;
+        try {
+          const geoRes = await fetch(`${API_URL}/geocode?lat=${currentLocation.lat}&lng=${currentLocation.lng}`);
+          if (geoRes.ok) geoDetails = await geoRes.json();
+        } catch { /* non-fatal */ }
+
+        addBotMessage(res.reply, { extracted: res.extracted, geoDetails });
+      } else {
+        addBotMessage(res.reply);
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Something went wrong. Please try again.";
       addBotMessage(`⚠️ ${msg}`);
@@ -394,6 +417,7 @@ export default function ChatWidget() {
       setSubmitted(true);
       setPendingImagePreview(null);
       setPendingImageFile(null);
+      setPendingImageDataUrl(null);
       setPendingLocation(null);
       setLocationConfirmed(false);
       addBotMessage(
@@ -554,16 +578,19 @@ export default function ChatWidget() {
                   {/* Text-based extracted complaint summary table */}
                   {msg.extracted && (
                     <div className="mt-3 rounded-lg border border-gray-300 bg-white p-3 text-xs dark:border-gray-600 dark:bg-gray-900">
-                      <p className="mb-2 font-semibold text-gray-700 dark:text-gray-200">📋 Complaint Summary</p>
+                      <p className="mb-2 font-semibold text-gray-700 dark:text-gray-200">📋 Confirm Your Complaint</p>
                       <table className="w-full text-left">
                         <tbody>
-                          {[
-                            ["Title", msg.extracted.title],
-                            ["Issue Type", msg.extracted.issue_type],
-                            ["Severity", msg.extracted.severity],
-                            ["Description", msg.extracted.description],
-                            ["Confidence", `${Math.round(msg.extracted.confidence * 100)}%`],
-                          ].map(([label, value]) => (
+                          {(
+                            [
+                              ["Title", msg.extracted.title],
+                              ["Issue Type", msg.extracted.issue_type],
+                              ["Severity", msg.extracted.severity],
+                              ["Location", msg.geoDetails?.formatted_address || "Detecting\u2026"],
+                              ["Description", msg.extracted.description],
+                              ["DIGIPIN", msg.geoDetails?.digipin || "Detecting\u2026"],
+                            ] as [string, string][]
+                          ).map(([label, value]) => (
                             <tr key={label} className="border-b border-gray-100 last:border-0 dark:border-gray-700">
                               <td className="py-1 pr-2 font-medium text-gray-500 dark:text-gray-400">{label}</td>
                               <td className="py-1 text-gray-800 dark:text-gray-200">{value}</td>
@@ -571,8 +598,8 @@ export default function ChatWidget() {
                           ))}
                         </tbody>
                       </table>
-                      <p className="mt-2 text-center text-[11px] text-gray-500 dark:text-gray-400">
-                        Type <strong>YES</strong> to submit, or tell me what to change.
+                      <p className="mt-2 text-center font-semibold text-amber-600 dark:text-amber-400">
+                        Type <strong>YES</strong> to confirm submission
                       </p>
                     </div>
                   )}
@@ -580,17 +607,23 @@ export default function ChatWidget() {
                   {/* Image-based ticket preview from FastAPI /analyze */}
                   {msg.imagePreview && (
                     <div className="mt-3 rounded-lg border border-gray-300 bg-white p-3 text-xs dark:border-gray-600 dark:bg-gray-900">
-                      <p className="mb-2 font-semibold text-gray-700 dark:text-gray-200">📷 Image Analysis Result</p>
+                      <p className="mb-2 font-semibold text-gray-700 dark:text-gray-200">� Confirm Your Complaint</p>
+                      {pendingImageDataUrl && (
+                        <img
+                          src={pendingImageDataUrl}
+                          alt="Issue photo"
+                          className="mb-2 rounded-lg max-h-32 w-full object-cover"
+                        />
+                      )}
                       <table className="w-full text-left">
                         <tbody>
                           {[
                             ["Title", msg.imagePreview.title],
-                            ["Issue", msg.imagePreview.issue_name],
+                            ["Issue Type", msg.imagePreview.issue_name],
                             ["Severity", `${msg.imagePreview.severity} (${msg.imagePreview.severity_db})`],
-                            ["Ward", msg.imagePreview.ward_name],
-                            ["Pincode", msg.imagePreview.pincode],
+                            ["Location", msg.imagePreview.formatted_address],
+                            ["Description", msg.imagePreview.description],
                             ["DIGIPIN", msg.imagePreview.digipin],
-                            ["Authority", msg.imagePreview.authority],
                           ].map(([label, value]) => (
                             <tr key={label} className="border-b border-gray-100 last:border-0 dark:border-gray-700">
                               <td className="py-1 pr-2 font-medium text-gray-500 dark:text-gray-400">{label}</td>
@@ -599,9 +632,8 @@ export default function ChatWidget() {
                           ))}
                         </tbody>
                       </table>
-                      <p className="mt-1 text-gray-600 dark:text-gray-300">{msg.imagePreview.description}</p>
-                      <p className="mt-2 text-center text-[11px] text-gray-500 dark:text-gray-400">
-                        Type <strong>YES</strong> to submit this ticket, or describe the issue differently.
+                      <p className="mt-2 text-center font-semibold text-amber-600 dark:text-amber-400">
+                        Type <strong>YES</strong> to confirm submission
                       </p>
                     </div>
                   )}

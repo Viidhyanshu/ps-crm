@@ -2,6 +2,7 @@ import os
 import json
 import uuid
 import base64
+import hashlib
 import re
 import asyncio
 import urllib.parse
@@ -190,6 +191,7 @@ class TicketCreated(BaseModel):
     longitude: float
     accuracy: float
     timestamp: str
+    image_metadata: Optional[Dict[str, str]] = None
 
 
 # =========================================================
@@ -593,6 +595,17 @@ Return ONLY JSON in this exact shape:
 
 
 # =========================================================
+# 6b. REVERSE GEOCODE ENDPOINT
+# =========================================================
+
+@app.get("/geocode")
+async def geocode(lat: float, lng: float):
+    """Return reverse-geocoded details (pincode, digipin, address, etc.)."""
+    location = await asyncio.to_thread(reverse_geocode_from_coordinates, lat, lng)
+    return location
+
+
+# =========================================================
 # 7. ANALYZE ENDPOINT  (preview only — does NOT write to DB)
 # =========================================================
 
@@ -684,6 +697,7 @@ async def confirm(
     ward_name: Optional[str] = Form(None),
     pincode: Optional[str] = Form(None),
     authorization: Optional[str] = Header(None),
+    user_agent: Optional[str] = Header(None),
 ):
     # 1. Extract citizen_id from JWT
     citizen_id = get_citizen_id_from_token(authorization)
@@ -710,6 +724,14 @@ async def confirm(
 
     # 2. Upload image to Supabase Storage
     image_data = await image.read()
+    image_hash = hashlib.sha256(image_data).hexdigest()
+    upload_time = datetime.now(timezone.utc).isoformat()
+    device_type = (user_agent or "unknown")[:120]
+    img_metadata = {
+        "upload_time": upload_time,
+        "image_hash": image_hash,
+        "device_type": device_type,
+    }
     filename = f"{uuid.uuid4()}.jpg"
     try:
         photo_url = upload_image_to_supabase(image_data, filename)
@@ -720,7 +742,10 @@ async def confirm(
 
     # 3. Build PostGIS geography point string
     location_wkt = f"POINT({longitude} {latitude})"
-    address_text = f"{formatted_address} | gps_accuracy_m={accuracy:.1f} | gps_timestamp={timestamp}"
+    address_text = (
+        f"{formatted_address} | gps_accuracy_m={accuracy:.1f} | gps_timestamp={timestamp}"
+        f" | img_hash={image_hash[:16]} | img_upload={upload_time} | device={device_type[:60]}"
+    )
     complaint_record = build_complaint_record(
         user_id=citizen_id,
         issue_type=category["name"],
@@ -791,6 +816,7 @@ async def confirm(
         longitude=longitude,
         accuracy=accuracy,
         timestamp=timestamp,
+        image_metadata=img_metadata,
     )
 
 
