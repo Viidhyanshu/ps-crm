@@ -95,8 +95,17 @@ export default function ChatWidget() {
 
   /** Get Supabase auth token */
   const getAuthToken = async (): Promise<string | null> => {
-    const { data } = await supabase.auth.getSession();
-    return data.session?.access_token ?? null;
+    // First check if user is actually authenticated
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return null;
+    
+    // Then get the session for the access token
+    const { data: { session } } = await supabase.auth.getSession();
+    if (session?.access_token) return session.access_token;
+    
+    // Fallback: try refreshing the session
+    const { data: refreshData } = await supabase.auth.refreshSession();
+    return refreshData.session?.access_token ?? null;
   };
 
   /* ----- open / close with GSAP ----- */

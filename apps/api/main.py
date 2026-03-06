@@ -201,6 +201,30 @@ def analyze_issue_with_gemini(
     longitude: float,
 ) -> dict:
 
+    def _call_gemini_json(local_prompt: str) -> dict:
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[local_prompt, image],
+            config={"temperature": 0},
+        )
+
+        raw = response.text.strip()
+
+        # Strip markdown fences if model adds them despite instructions
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Gemini returned non-JSON response: {raw[:300]}"
+            )
+
     prompt = f"""
 You are a strict civic issue analyst for a Delhi government complaint platform.
 
@@ -271,34 +295,38 @@ Return ONLY this exact JSON:
 If image is NOT a civic infrastructure issue return exactly: {{"error": "INVALID"}}
 """
 
-    response = gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[prompt, image],
-        config={"temperature": 0},
-    )
-
-    raw = response.text.strip()
-
-    # Strip markdown fences if model adds them despite instructions
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-
-    try:
-        result = json.loads(raw)
-    except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Gemini returned non-JSON response: {raw[:300]}"
-        )
+    result = _call_gemini_json(prompt)
 
     if result.get("error") == "INVALID":
-        raise HTTPException(
-            status_code=400,
-            detail="This assistant can only be used to report civic infrastructure issues."
-        )
+        # Fallback pass: force a best-effort civic classification instead of rejecting outright.
+        fallback_prompt = f"""
+You are a Delhi civic issue classifier.
+
+The previous classifier marked the image as INVALID, but for this workflow you MUST return
+the closest civic infrastructure category with a best-effort assessment.
+Never return INVALID.
+
+Device coordinates:
+Latitude : {latitude}
+Longitude: {longitude}
+
+User description:
+{text}
+
+Choose one child_id from 1-42. If the issue appears to involve lighting/poles/wires,
+prefer 22, 25, 33, or 34.
+
+Return ONLY JSON in this exact shape:
+{{
+  "child_id": <integer 1-42>,
+  "title": "<5-10 word title>",
+  "description": "<2-3 sentence best-effort assessment>",
+  "severity": "<Low | Medium | High | Critical>",
+  "ward_name": "<ward name from coordinates>",
+  "pincode": "<6-digit pincode from coordinates>"
+}}
+"""
+        result = _call_gemini_json(fallback_prompt)
 
     child_id = result.get("child_id")
     if not isinstance(child_id, int) or child_id not in CHILD_CATEGORIES:
