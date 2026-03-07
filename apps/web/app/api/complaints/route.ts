@@ -8,6 +8,19 @@ const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const supabaseServiceKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 const mapplsApiKey = process.env.MAPPLS_API_KEY ?? process.env.NEXT_PUBLIC_MAPPLS_API_KEY ?? "";
 const reverseGeocodeCache = new Map<string, ReverseGeo>();
+const ALLOWED_STATUSES = ["submitted", "verified", "assigned", "in_progress", "resolved", "closed"] as const;
+type LifecycleStatus = (typeof ALLOWED_STATUSES)[number];
+type DbStatus = Database["public"]["Enums"]["complaint_status"];
+const DB_STATUS_BY_LIFECYCLE: Record<LifecycleStatus, DbStatus> = {
+  submitted: "submitted",
+  verified: "under_review",
+  assigned: "assigned",
+  in_progress: "in_progress",
+  resolved: "resolved",
+  closed: "resolved",
+};
+const DUPLICATE_LOOKBACK_HOURS = 24;
+const DUPLICATE_RADIUS_METERS = 50;
 const issueTypeAuthorityKeywords: Array<{ keywords: string[]; authority: string }> = [
   { keywords: ["street light", "light", "electricity", "power", "wire", "transformer"], authority: "DISCOM" },
   { keywords: ["garbage", "waste", "sanitation", "sweeping", "toilet", "drain", "sewage"], authority: "MCD" },
@@ -41,6 +54,16 @@ interface ComplaintPayload {
   address_text?: string;
   assigned_department?: string;
   city?: string;
+  force_submit?: boolean;
+}
+
+interface UpvotePayload {
+  complaint_id: string;
+}
+
+interface StatusUpdatePayload {
+  complaint_id: string;
+  status: LifecycleStatus;
 }
 
 interface CanonicalComplaintRecord {
@@ -70,6 +93,32 @@ interface ReverseGeo {
   state: string;
   formattedAddress: string;
   digipin: string;
+}
+
+interface DuplicateMatch {
+  id: string;
+  ticket_id: string;
+  title: string;
+  status: string;
+  created_at: string;
+  distance_m: number;
+}
+
+function canTransitionStatus(current: string, next: string): boolean {
+  const order = ALLOWED_STATUSES;
+  const from = order.indexOf(current as (typeof ALLOWED_STATUSES)[number]);
+  const to = order.indexOf(next as (typeof ALLOWED_STATUSES)[number]);
+  if (from === -1 || to === -1) return false;
+  return to >= from;
+}
+
+function toLifecycleStatus(status: unknown): LifecycleStatus {
+  if (status === "submitted") return "submitted";
+  if (status === "under_review") return "verified";
+  if (status === "assigned") return "assigned";
+  if (status === "in_progress") return "in_progress";
+  if (status === "resolved") return "resolved";
+  return "submitted";
 }
 
 function cacheKey(latitude: number, longitude: number): string {
@@ -241,6 +290,62 @@ function routeAuthority(input: {
   return routed;
 }
 
+function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const toRad = (v: number) => (v * Math.PI) / 180;
+  const r = 6371000;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return r * c;
+}
+
+function parsePointLocation(locationValue: unknown): { lat: number; lng: number } | null {
+  if (typeof locationValue === "string") {
+    const match = /POINT\(([-0-9.]+)\s+([-0-9.]+)\)/.exec(locationValue);
+    if (match) return { lng: Number(match[1]), lat: Number(match[2]) };
+  }
+  return null;
+}
+
+async function findRecentDuplicate(input: {
+  categoryId: number;
+  latitude: number;
+  longitude: number;
+}): Promise<DuplicateMatch | null> {
+  const since = new Date(Date.now() - DUPLICATE_LOOKBACK_HOURS * 60 * 60 * 1000).toISOString();
+  const { data, error } = await supabase
+    .from("complaints")
+    .select("id, ticket_id, title, status, created_at, location")
+    .eq("category_id", input.categoryId)
+    .gte("created_at", since)
+    .limit(100);
+
+  if (error || !data) return null;
+
+  for (const row of data) {
+    const coords = parsePointLocation(row.location);
+    if (!coords) continue;
+    const distance = haversineMeters(input.latitude, input.longitude, coords.lat, coords.lng);
+    if (distance <= DUPLICATE_RADIUS_METERS) {
+      const safeStatus = typeof row.status === "string" && ALLOWED_STATUSES.includes(row.status as (typeof ALLOWED_STATUSES)[number])
+        ? (row.status as LifecycleStatus)
+        : toLifecycleStatus(row.status);
+      return {
+        id: row.id,
+        ticket_id: row.ticket_id ?? row.id,
+        title: row.title,
+        status: safeStatus,
+        created_at: row.created_at,
+        distance_m: Number(distance.toFixed(1)),
+      };
+    }
+  }
+  return null;
+}
+
 /**
  * POST /api/complaints
  * Creates a new complaint in Supabase.
@@ -269,6 +374,7 @@ export async function POST(req: NextRequest) {
     address_text,
     assigned_department,
     city,
+    force_submit,
   } = body;
 
   // Validate required fields
@@ -294,7 +400,7 @@ export async function POST(req: NextRequest) {
   const resolvedAddress = (address_text?.trim() || resolved.formattedAddress).trim();
   const resolvedWard = (ward_name?.trim() || resolved.locality || "Unknown locality").trim();
   const resolvedCity = (city?.trim() || resolved.city || "Delhi").trim();
-  const addressWithMeta = `${resolvedAddress} | gps_accuracy_m=${accuracy.toFixed(1)} | gps_timestamp=${timestamp}`;
+  const addressWithMeta = `${resolvedAddress} | gps_lat=${latitude.toFixed(6)} | gps_lng=${longitude.toFixed(6)} | gps_accuracy_m=${accuracy.toFixed(1)} | gps_timestamp=${timestamp}`;
   const canonicalComplaint = buildCanonicalComplaintRecord({
     userId: citizen_id,
     issueType: (issue_type?.trim() || title.trim()),
@@ -323,6 +429,23 @@ export async function POST(req: NextRequest) {
   // Build PostGIS WKT POINT string
   const locationWKT = `SRID=4326;POINT(${longitude} ${latitude})`;
 
+  const duplicate = await findRecentDuplicate({
+    categoryId: category_id,
+    latitude,
+    longitude,
+  });
+  if (duplicate && !force_submit) {
+    return NextResponse.json(
+      {
+        error: "A similar complaint exists within 50 meters in the last 24 hours.",
+        code: "DUPLICATE_DETECTED",
+        duplicate,
+        options: ["upload_anyway", "upvote_existing"],
+      },
+      { status: 409 },
+    );
+  }
+
   const { data, error } = await supabase
     .from("complaints")
     .insert({
@@ -339,6 +462,7 @@ export async function POST(req: NextRequest) {
       address_text: addressWithMeta,
       assigned_department: canonicalComplaint.authority,
       city: canonicalComplaint.city,
+      possible_duplicate: Boolean(duplicate),
     })
     .select("id, ticket_id, title, status, created_at")
     .single();
@@ -349,4 +473,94 @@ export async function POST(req: NextRequest) {
   }
 
   return NextResponse.json({ success: true, complaint: data }, { status: 201 });
+}
+
+/**
+ * PATCH /api/complaints
+ * Upvote an existing complaint (used when duplicate is detected).
+ */
+export async function PATCH(req: NextRequest) {
+  const body = (await req.json().catch(() => null)) as UpvotePayload | null;
+  if (!body?.complaint_id) {
+    return NextResponse.json({ error: "complaint_id is required" }, { status: 400 });
+  }
+
+  const { data: current, error: fetchError } = await supabase
+    .from("complaints")
+    .select("id, upvote_count, ticket_id, status")
+    .eq("id", body.complaint_id)
+    .single();
+
+  if (fetchError || !current) {
+    return NextResponse.json({ error: "Complaint not found" }, { status: 404 });
+  }
+
+  const nextCount = (current.upvote_count ?? 0) + 1;
+  const { data: updated, error: updateError } = await supabase
+    .from("complaints")
+    .update({ upvote_count: nextCount })
+    .eq("id", body.complaint_id)
+    .select("id, ticket_id, upvote_count, status")
+    .single();
+
+  if (updateError) {
+    return NextResponse.json({ error: updateError.message }, { status: 500 });
+  }
+
+  return NextResponse.json({ success: true, complaint: updated }, { status: 200 });
+}
+
+/**
+ * PUT /api/complaints
+ * Update complaint status with lifecycle validation.
+ */
+export async function PUT(req: NextRequest) {
+  const body = (await req.json().catch(() => null)) as StatusUpdatePayload | null;
+  if (!body?.complaint_id || !body?.status) {
+    return NextResponse.json({ error: "complaint_id and status are required" }, { status: 400 });
+  }
+
+  if (!ALLOWED_STATUSES.includes(body.status)) {
+    return NextResponse.json({ error: "Invalid status value" }, { status: 400 });
+  }
+
+  const { data: existing, error: fetchError } = await supabase
+    .from("complaints")
+    .select("id, status, ticket_id")
+    .eq("id", body.complaint_id)
+    .single();
+
+  if (fetchError || !existing) {
+    return NextResponse.json({ error: "Complaint not found" }, { status: 404 });
+  }
+
+  const currentStatus = toLifecycleStatus(existing.status);
+  if (!canTransitionStatus(currentStatus, body.status)) {
+    return NextResponse.json(
+      { error: `Invalid status transition: ${currentStatus} -> ${body.status}` },
+      { status: 409 },
+    );
+  }
+
+  const { data: updated, error: updateError } = await supabase
+    .from("complaints")
+    .update({ status: DB_STATUS_BY_LIFECYCLE[body.status] })
+    .eq("id", body.complaint_id)
+    .select("id, ticket_id, status, updated_at")
+    .single();
+
+  if (updateError) {
+    return NextResponse.json({ error: updateError.message }, { status: 500 });
+  }
+
+  return NextResponse.json(
+    {
+      success: true,
+      complaint: {
+        ...updated,
+        status: toLifecycleStatus(updated?.status),
+      },
+    },
+    { status: 200 },
+  );
 }

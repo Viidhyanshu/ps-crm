@@ -61,8 +61,23 @@ interface ImageTicketPreview {
   longitude: number;
   accuracy: number;
   timestamp: string;
+  confidence: number;
   user_text: string;
   confirm_prompt: string;
+}
+
+interface DuplicateMatch {
+  id: string;
+  ticket_id: string;
+  title: string;
+  status: string;
+  created_at: string;
+  distance_m: number;
+}
+
+interface DuplicateContext {
+  mode: "image" | "text";
+  duplicate: DuplicateMatch;
 }
 
 interface DeviceLocation {
@@ -114,6 +129,7 @@ export default function ChatWidget() {
   const [pendingImageFile, setPendingImageFile] = useState<File | null>(null);
   const [pendingImageDataUrl, setPendingImageDataUrl] = useState<string | null>(null);
   const [pendingLocation, setPendingLocation] = useState<DeviceLocation | null>(null);
+  const [duplicateContext, setDuplicateContext] = useState<DuplicateContext | null>(null);
   const [locationConfirmed, setLocationConfirmed] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);
@@ -277,10 +293,23 @@ export default function ChatWidget() {
 
           const preview: ImageTicketPreview = await res.json();
 
+          if (preview.confidence < 0.6) {
+            setPendingImagePreview(null);
+            setPendingImageFile(null);
+            setPendingLocation(null);
+            setLocationConfirmed(false);
+            setDuplicateContext(null);
+            addBotMessage(
+              "⚠️ I am not confident enough about this image analysis (confidence below 0.6). Please describe the issue manually so I can file it accurately.",
+            );
+            return;
+          }
+
           // Store for confirmation
           setPendingImagePreview(preview);
           setPendingImageFile(file);
           setPendingComplaint(null); // clear any text-based pending
+          setDuplicateContext(null);
           setPendingLocation({
             lat: preview.latitude,
             lng: preview.longitude,
@@ -310,6 +339,24 @@ export default function ChatWidget() {
 
     setInput("");
 
+    if (duplicateContext && /^(upvote|support|same)$/i.test(trimmed)) {
+      setMessages((prev) => [...prev, { id: uid(), role: "user", text: trimmed }]);
+      scrollToBottom();
+      await upvoteDuplicate();
+      return;
+    }
+
+    if (duplicateContext && /^(yes again|upload anyway|force|submit anyway)$/i.test(trimmed)) {
+      setMessages((prev) => [...prev, { id: uid(), role: "user", text: trimmed }]);
+      scrollToBottom();
+      if (duplicateContext.mode === "image") {
+        await confirmImageTicket(true);
+      } else {
+        await submitComplaint(true);
+      }
+      return;
+    }
+
     // If the user typed YES and we have a pending image preview → confirm via FastAPI
     if (pendingImagePreview && /^(yes|confirm|submit|haan|ha|हां)$/i.test(trimmed)) {
       if (!locationConfirmed || !pendingLocation) {
@@ -318,7 +365,7 @@ export default function ChatWidget() {
       }
       setMessages((prev) => [...prev, { id: uid(), role: "user", text: trimmed }]);
       scrollToBottom();
-      await confirmImageTicket();
+      await confirmImageTicket(false);
       return;
     }
 
@@ -330,7 +377,7 @@ export default function ChatWidget() {
       }
       setMessages((prev) => [...prev, { id: uid(), role: "user", text: trimmed }]);
       scrollToBottom();
-      await submitComplaint();
+      await submitComplaint(false);
       return;
     }
 
@@ -345,9 +392,23 @@ export default function ChatWidget() {
       historyRef.current.push({ role: "model", text: res.reply });
 
       if (res.extracted) {
+        if (res.extracted.confidence < 0.6) {
+          setPendingComplaint(null);
+          setPendingImagePreview(null);
+          setPendingImageDataUrl(null);
+          setPendingLocation(null);
+          setLocationConfirmed(false);
+          setDuplicateContext(null);
+          addBotMessage(
+            "⚠️ I am not confident enough in the issue extraction (confidence below 0.6). Please describe the issue manually with key details (what, where, urgency).",
+          );
+          return;
+        }
+
         setPendingComplaint(res.extracted);
         setPendingImagePreview(null);
         setPendingImageDataUrl(null);
+        setDuplicateContext(null);
         const currentLocation = await getLocation();
         setPendingLocation(currentLocation);
         setLocationConfirmed(false);
@@ -368,10 +429,10 @@ export default function ChatWidget() {
     } finally {
       setIsLoading(false);
     }
-  }, [input, isLoading, pendingComplaint, pendingImagePreview, scrollToBottom, addBotMessage]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [input, isLoading, pendingComplaint, pendingImagePreview, duplicateContext, scrollToBottom, addBotMessage]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ----- confirm image ticket via FastAPI /confirm ----- */
-  const confirmImageTicket = useCallback(async () => {
+  const confirmImageTicket = useCallback(async (forceSubmit = false) => {
     if (!pendingImagePreview || !pendingImageFile) return;
     setSubmitting(true);
 
@@ -400,6 +461,7 @@ export default function ChatWidget() {
       formData.append("title", pendingImagePreview.title);
       formData.append("description", pendingImagePreview.description);
       formData.append("severity_db", pendingImagePreview.severity_db);
+      formData.append("force_submit", String(forceSubmit));
 
       const res = await fetch(`${API_URL}/confirm`, {
         method: "POST",
@@ -409,7 +471,15 @@ export default function ChatWidget() {
 
       if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: "Submission failed" }));
-        throw new Error(err.detail || "Failed to submit complaint");
+        const detail = err?.detail;
+        if (res.status === 409 && detail?.code === "DUPLICATE_DETECTED" && detail?.duplicate) {
+          setDuplicateContext({ mode: "image", duplicate: detail.duplicate as DuplicateMatch });
+          addBotMessage(
+            `⚠️ Similar complaint already exists (Ticket **${detail.duplicate.ticket_id}**, ${detail.duplicate.distance_m}m away, status: **${detail.duplicate.status}**). Type **UPVOTE** to support it, or type **YES AGAIN** to upload anyway.`,
+          );
+          return;
+        }
+        throw new Error(detail?.message || detail || "Failed to submit complaint");
       }
 
       const created = await res.json();
@@ -419,6 +489,7 @@ export default function ChatWidget() {
       setPendingImageFile(null);
       setPendingImageDataUrl(null);
       setPendingLocation(null);
+      setDuplicateContext(null);
       setLocationConfirmed(false);
       addBotMessage(
         `✅ **Complaint submitted successfully!**\n\n🎫 Ticket ID: **${created.ticket_id}**\n📋 Issue: **${created.issue_name}**\n🏢 Department: **${created.authority}**\nStatus: **Submitted**\n\nYou can track your complaint from the "Your Tickets" section. Is there anything else I can help you with?`,
@@ -429,10 +500,10 @@ export default function ChatWidget() {
     } finally {
       setSubmitting(false);
     }
-  }, [pendingImagePreview, pendingImageFile, addBotMessage]);
+  }, [pendingImagePreview, pendingImageFile, pendingLocation, addBotMessage]);
 
   /* ----- submit text-based complaint to Supabase ----- */
-  const submitComplaint = useCallback(async () => {
+  const submitComplaint = useCallback(async (forceSubmit = false) => {
     if (!pendingComplaint) return;
     setSubmitting(true);
 
@@ -466,18 +537,28 @@ export default function ChatWidget() {
           accuracy: submitLocation.accuracy,
           timestamp: submitLocation.timestamp,
           city: "Delhi",
+          force_submit: forceSubmit,
         }),
       });
 
       const data = await res.json();
 
       if (!res.ok) {
+        if (res.status === 409 && data?.code === "DUPLICATE_DETECTED" && data?.duplicate) {
+          setDuplicateContext({ mode: "text", duplicate: data.duplicate as DuplicateMatch });
+          addBotMessage(
+            `⚠️ Similar complaint already exists (Ticket **${data.duplicate.ticket_id}**, ${data.duplicate.distance_m}m away, status: **${data.duplicate.status}**). Type **UPVOTE** to support it, or type **YES AGAIN** to upload anyway.`,
+          );
+          setSubmitting(false);
+          return;
+        }
         throw new Error(data.error || "Failed to submit complaint");
       }
 
       setSubmitted(true);
       setPendingComplaint(null);
       setPendingLocation(null);
+      setDuplicateContext(null);
       setLocationConfirmed(false);
       addBotMessage(
         `✅ **Complaint submitted successfully!**\n\n🎫 Ticket ID: **${data.complaint?.ticket_id ?? data.complaint?.id}**\nStatus: **Submitted**\n\nYou can track your complaint from the "Your Tickets" section. Is there anything else I can help you with?`,
@@ -488,7 +569,37 @@ export default function ChatWidget() {
     } finally {
       setSubmitting(false);
     }
-  }, [pendingComplaint, addBotMessage]);
+  }, [pendingComplaint, pendingLocation, addBotMessage]);
+
+  const upvoteDuplicate = useCallback(async () => {
+    if (!duplicateContext?.duplicate?.id) return;
+    setSubmitting(true);
+    try {
+      const res = await fetch("/api/complaints", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ complaint_id: duplicateContext.duplicate.id }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to upvote complaint");
+
+      setDuplicateContext(null);
+      setPendingComplaint(null);
+      setPendingImagePreview(null);
+      setPendingImageFile(null);
+      setPendingImageDataUrl(null);
+      setPendingLocation(null);
+      setLocationConfirmed(false);
+      addBotMessage(
+        `✅ Upvoted ticket **${data.complaint?.ticket_id ?? duplicateContext.duplicate.ticket_id}**. Current status: **${data.complaint?.status ?? duplicateContext.duplicate.status}**. Thank you for supporting status transparency.`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Upvote failed";
+      addBotMessage(`❌ ${msg}.`);
+    } finally {
+      setSubmitting(false);
+    }
+  }, [duplicateContext, addBotMessage]);
 
   /* ----- auto-scroll on new messages ----- */
   useEffect(scrollToBottom, [messages, scrollToBottom]);
@@ -607,7 +718,7 @@ export default function ChatWidget() {
                   {/* Image-based ticket preview from FastAPI /analyze */}
                   {msg.imagePreview && (
                     <div className="mt-3 rounded-lg border border-gray-300 bg-white p-3 text-xs dark:border-gray-600 dark:bg-gray-900">
-                      <p className="mb-2 font-semibold text-gray-700 dark:text-gray-200">� Confirm Your Complaint</p>
+                      <p className="mb-2 font-semibold text-gray-700 dark:text-gray-200">Confirm Your Complaint</p>
                       {pendingImageDataUrl && (
                         <img
                           src={pendingImageDataUrl}
@@ -726,7 +837,7 @@ export default function ChatWidget() {
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder={hasPending ? "Confirm location, then type YES to submit…" : "Describe your issue…"}
+                placeholder={duplicateContext ? "Type UPVOTE or YES AGAIN..." : hasPending ? "Confirm location, then type YES to submit..." : "Describe your issue..."}
                 disabled={submitting}
                 className="flex-1 rounded-full border border-gray-200 bg-gray-50 px-4 py-2 text-sm text-gray-800 outline-none transition-colors placeholder:text-gray-400 focus:border-[#b4725a] dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 dark:placeholder:text-gray-500 dark:focus:border-purple-500"
               />

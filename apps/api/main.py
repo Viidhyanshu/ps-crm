@@ -11,6 +11,7 @@ from pathlib import Path
 from io import BytesIO
 from datetime import datetime, timezone
 from typing import Optional, Dict, List, Any
+from math import radians, sin, cos, sqrt, atan2
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,6 +45,9 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 REVERSE_GEOCODE_CACHE: Dict[str, Dict[str, str]] = {}
+ALLOWED_STATUSES = {"submitted", "verified", "assigned", "in_progress", "resolved", "closed"}
+DUPLICATE_LOOKBACK_HOURS = 24
+DUPLICATE_RADIUS_METERS = 50.0
 
 ISSUE_TYPE_AUTHORITY_KEYWORDS = [
     (["street light", "light", "electricity", "power", "wire", "transformer"], "DISCOM"),
@@ -72,6 +76,8 @@ app = FastAPI(
 origins = [
     "http://localhost:3000",
     "http://localhost:3001",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
     "https://jansamadhan.perkkk.dev",
     "https://api.jansamadhan.perkkk.dev",
 ]
@@ -169,6 +175,7 @@ class TicketPreview(BaseModel):
     longitude: float
     accuracy: float
     timestamp: str
+    confidence: float
     user_text: str
     confirm_prompt: str    # Instruction shown below ticket preview in chat
 
@@ -257,6 +264,62 @@ def _fallback_digipin(latitude: float, longitude: float) -> str:
     lat = str(abs(latitude)).replace(".", "")[:8]
     lng = str(abs(longitude)).replace(".", "")[:8]
     return f"DG-{lat}-{lng}"
+
+
+def _haversine_meters(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    r = 6371000.0
+    d_lat = radians(lat2 - lat1)
+    d_lng = radians(lng2 - lng1)
+    a = sin(d_lat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(d_lng / 2) ** 2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    return r * c
+
+
+def _parse_coords_from_location(location_value: Any) -> Optional[Dict[str, float]]:
+    if isinstance(location_value, str):
+        match = re.search(r"POINT\(([-0-9.]+)\s+([-0-9.]+)\)", location_value)
+        if match:
+            return {"lng": float(match.group(1)), "lat": float(match.group(2))}
+    return None
+
+
+def _find_recent_duplicate(
+    *,
+    category_id: int,
+    latitude: float,
+    longitude: float,
+    lookback_hours: int = DUPLICATE_LOOKBACK_HOURS,
+) -> Optional[Dict[str, Any]]:
+    since_iso = datetime.now(timezone.utc).timestamp() - lookback_hours * 3600
+    since = datetime.fromtimestamp(since_iso, tz=timezone.utc).isoformat()
+
+    try:
+        rows = (
+            supabase.table("complaints")
+            .select("id, ticket_id, title, status, created_at, location")
+            .eq("category_id", category_id)
+            .gte("created_at", since)
+            .limit(100)
+            .execute()
+        )
+    except Exception:
+        return None
+
+    for row in rows.data or []:
+        coords = _parse_coords_from_location(row.get("location"))
+        if not coords:
+            continue
+        distance_m = _haversine_meters(latitude, longitude, coords["lat"], coords["lng"])
+        if distance_m <= DUPLICATE_RADIUS_METERS:
+            return {
+                "id": row.get("id"),
+                "ticket_id": row.get("ticket_id") or row.get("id"),
+                "title": row.get("title") or "Existing complaint",
+                "status": row.get("status") if row.get("status") in ALLOWED_STATUSES else "submitted",
+                "created_at": row.get("created_at") or "",
+                "distance_m": round(distance_m, 1),
+            }
+    return None
 
 
 def reverse_geocode_from_coordinates(latitude: float, longitude: float) -> Dict[str, str]:
@@ -541,9 +604,10 @@ Based on visual damage and safety risk:
 Return ONLY this exact JSON:
 {{
   "child_id": <integer 1-42>,
-    "title": "<5-10 word title describing issue>",
-    "description": "<2-3 sentences: what is visible and what is wrong>",
-    "severity": "<Low | Medium | High | Critical>"
+        "title": "<5-10 word title describing issue>",
+        "description": "<2-3 sentences: what is visible and what is wrong>",
+        "severity": "<Low | Medium | High | Critical>",
+        "confidence": <float between 0 and 1>
 }}
 
 If image is NOT a civic infrastructure issue return exactly: {{"error": "INVALID"}}
@@ -575,7 +639,8 @@ Return ONLY JSON in this exact shape:
   "child_id": <integer 1-42>,
   "title": "<5-10 word title>",
   "description": "<2-3 sentence best-effort assessment>",
-    "severity": "<Low | Medium | High | Critical>"
+        "severity": "<Low | Medium | High | Critical>",
+        "confidence": <float between 0 and 1>
 }}
 """
         result = _call_gemini_json(fallback_prompt)
@@ -586,6 +651,12 @@ Return ONLY JSON in this exact shape:
 
     if result.get("severity") not in {"Low", "Medium", "High", "Critical"}:
         raise HTTPException(status_code=500, detail=f"Gemini returned invalid severity: {result.get('severity')}")
+
+    confidence = result.get("confidence")
+    if not isinstance(confidence, (int, float)):
+        result["confidence"] = 0.5
+    else:
+        result["confidence"] = max(0.0, min(1.0, float(confidence)))
 
     for field in ["title", "description"]:
         if not result.get(field):
@@ -669,6 +740,7 @@ async def analyze(
         longitude=longitude,
         accuracy=accuracy,
         timestamp=timestamp,
+        confidence=result["confidence"],
         user_text=user_text,
         confirm_prompt="✅ Ticket preview ready. Type \"confirm\" or \"submit\" to raise this ticket, or describe the issue differently to re-analyse.",
     )
@@ -696,6 +768,7 @@ async def confirm(
     severity_db: str = Form(...),     # L1 / L2 / L3 / L4
     ward_name: Optional[str] = Form(None),
     pincode: Optional[str] = Form(None),
+    force_submit: bool = Form(False),
     authorization: Optional[str] = Header(None),
     user_agent: Optional[str] = Header(None),
 ):
@@ -709,6 +782,19 @@ async def confirm(
         raise HTTPException(status_code=400, detail=f"Invalid severity_db: {severity_db}")
 
     category = CHILD_CATEGORIES[child_id]
+
+    duplicate = _find_recent_duplicate(category_id=child_id, latitude=latitude, longitude=longitude)
+    if duplicate and not force_submit:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "DUPLICATE_DETECTED",
+                "message": "A similar complaint exists within 50 meters in the last 24 hours.",
+                "duplicate": duplicate,
+                "options": ["upload_anyway", "upvote_existing"],
+            },
+        )
+
     location = reverse_geocode_from_coordinates(latitude, longitude)
     derived_ward_name = location["locality"] or (ward_name or "Unknown locality")
     derived_pincode = location["pincode"] or (pincode or "000000")
@@ -784,6 +870,7 @@ async def confirm(
             "city":                complaint_record["city"],
             "upvote_count":        0,
             "is_spam":             False,
+            "possible_duplicate":  bool(duplicate),
             "sla_breached":        False,
             "escalation_level":    0,
             "upvote_boost":        0,

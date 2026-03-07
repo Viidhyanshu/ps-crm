@@ -10,6 +10,8 @@ const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL ?? "gemini-2.0-f
 const ALLOWED_ORIGINS = new Set([
   "http://localhost:3000",
   "http://localhost:3001",
+  "http://127.0.0.1:3000",
+  "http://127.0.0.1:3001",
   "https://jansamadhan.perkkk.dev",
   "https://api.jansamadhan.perkkk.dev",
 ]);
@@ -139,6 +141,7 @@ export async function POST(req: NextRequest): Promise<NextResponse<GeminiRespons
       );
 
       data = (await geminiRes.json()) as GeminiApiResponse;
+      console.error(`[Gemini ${model}] raw:`, JSON.stringify(data));  // ← ADD THIS
 
       if (!data.error) {
         quotaFailure = false;
