@@ -6,7 +6,16 @@ import gsap from "gsap";
 import { sendToGemini } from "@/lib/gemini";
 import type { ChatMessage, ExtractedComplaint, GeminiResponse } from "@/lib/gemini";
 import { supabase } from "@/src/lib/supabase";
-import LocationPinPicker from "@/components/LocationPinPicker";
+import dynamic from "next/dynamic";
+
+const LocationPinPicker = dynamic(() => import("@/components/LocationPinPicker"), {
+  ssr: false,
+  loading: () => (
+    <div className="h-40 w-full rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 flex items-center justify-center text-xs text-gray-400">
+      Loading map…
+    </div>
+  ),
+});
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
